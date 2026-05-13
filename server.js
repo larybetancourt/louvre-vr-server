@@ -44,7 +44,7 @@ const inicioServer = Date.now();
 io.on('connection', (socket) => {
 
   // 1 · Registro de usuario
-  socket.on('registrar', ({ nombre, rol }) => {
+  socket.on('registrar', ({ nombre, rol, avatar }) => {
     if (rol === 'profesor' && sala.profesorId) {
       rol = 'estudiante';
       socket.emit('rol_cambiado', { rol, motivo: 'Ya existe un profesor activo' });
@@ -53,6 +53,7 @@ io.on('connection', (socket) => {
       id: socket.id,
       nombre: (nombre || 'Usuario').substring(0, 24),
       rol,
+      avatar: avatar || null,
       posicion: { x: 0, y: 0, z: 2 },
       rotacion: { x: 0, y: 0, z: 0 },
       manoLevantada: false,
