@@ -44,7 +44,7 @@ const inicioServer = Date.now();
 io.on('connection', (socket) => {
 
   // 1 · Registro de usuario
-  socket.on('registrar', ({ nombre, rol, avatar }) => {
+  socket.on('registrar', ({ nombre, rol, avatar, entorno }) => {
     if (rol === 'profesor' && sala.profesorId) {
       rol = 'estudiante';
       socket.emit('rol_cambiado', { rol, motivo: 'Ya existe un profesor activo' });
@@ -54,6 +54,7 @@ io.on('connection', (socket) => {
       nombre: (nombre || 'Usuario').substring(0, 24),
       rol,
       avatar: avatar || null,
+      entorno: entorno || 'museo',
       posicion: { x: 0, y: 0, z: 2 },
       rotacion: { x: 0, y: 0, z: 0 },
       manoLevantada: false,
@@ -129,10 +130,23 @@ io.on('connection', (socket) => {
     mensajesTotal++;
   });
 
-  // 6 · Ping para medir latencia (WP4)
+  // 6 · Estado micrófono (Sistema Solar)
+  socket.on('mic_estado', ({ activo }) => {
+    if (!sala.usuarios[socket.id]) return;
+    sala.usuarios[socket.id].hablando = activo;
+    socket.broadcast.emit('usuario_mic', { id: socket.id, activo });
+    mensajesTotal++;
+  });
+
+  // 7 · WebRTC señalización (Sistema Solar — audio en tiempo real)
+  socket.on('webrtc_offer',   ({ to, offer })     => io.to(to).emit('webrtc_offer',   { from: socket.id, offer }));
+  socket.on('webrtc_answer',  ({ to, answer })    => io.to(to).emit('webrtc_answer',  { from: socket.id, answer }));
+  socket.on('webrtc_ice',     ({ to, candidate }) => io.to(to).emit('webrtc_ice',     { from: socket.id, candidate }));
+
+  // 8 · Ping para medir latencia (WP4)
   socket.on('ping_lat', (ts) => socket.emit('pong_lat', ts));
 
-  // 7 · Métricas del servidor (WP4)
+  // 9 · Métricas del servidor (WP4)
   socket.on('pedir_metricas', () => {
     socket.emit('metricas', {
       usuariosConectados: Object.keys(sala.usuarios).length,
@@ -143,7 +157,7 @@ io.on('connection', (socket) => {
     });
   });
 
-  // 8 · Desconexión
+  // 10 · Desconexión
   socket.on('disconnect', () => {
     if (!sala.usuarios[socket.id]) return;
     const u = sala.usuarios[socket.id];
@@ -172,5 +186,5 @@ app.get('/estado', (_req, res) => res.json({
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () =>
-  console.log(`🏛️  Servidor Louvre VR activo en :${PORT}  |  /estado para métricas`)
+  console.log(`🏛️🚀 Servidor Louvre + Sistema Solar VR activo en :${PORT}  |  /estado`)
 );
