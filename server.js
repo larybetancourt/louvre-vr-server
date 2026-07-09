@@ -133,8 +133,14 @@ io.on('connection', (socket) => {
   // 6 · Estado micrófono (Sistema Solar)
   socket.on('mic_estado', ({ activo }) => {
     if (!sala.usuarios[socket.id]) return;
-    sala.usuarios[socket.id].hablando = activo;
-    socket.broadcast.emit('usuario_mic', { id: socket.id, activo });
+    const u = sala.usuarios[socket.id];
+    u.hablando = activo;
+    // IMPORTANTE: mandamos rol y nombre siempre, no solo id/activo.
+    // El cliente necesita "rol" para saber si quien prendió el mic es el
+    // profesor (y así activar el foco de cámara en los estudiantes) — si no
+    // viaja aquí, esa lógica del cliente nunca se activa por esta vía y queda
+    // dependiendo solo del canal WebRTC (que no siempre conecta en celular).
+    socket.broadcast.emit('usuario_mic', { id: socket.id, activo, rol: u.rol, nombre: u.nombre });
     mensajesTotal++;
   });
 
