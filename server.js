@@ -1,5 +1,5 @@
 /**
- * SERVIDOR MULTIUSUARIO — MUSEO LOUVRE VR
+ * SERVIDOR MULTIUSUARIO — MUSEO LOUVRE VR + SISTEMA SOLAR VR
  * Universidad del Cauca | Proyecto de Grado 2026
  * Lary Betancourt & Laura Sánchez
  *
@@ -12,6 +12,23 @@
  *   2. Reemplazar server.js y package.json con estos archivos
  *   3. Glitch reinicia automáticamente
  *   4. Copiar la URL del proyecto (ej: https://mi-museo-louvre.glitch.me)
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * CAMBIO IMPORTANTE respecto a la versión anterior:
+ * Antes, "sala" era un único objeto global compartido por TODOS los
+ * conectados, sin importar si estaban en el museo o en el sistema solar.
+ * Por eso alguien que entraba al museo también "aparecía" en el sistema
+ * solar (y viceversa): los eventos (usuario_entro, mover, mano, dar_turno,
+ * mic_estado, chat...) se mandaban a TODO el servidor con io.emit() /
+ * socket.broadcast.emit(), sin filtrar por entorno.
+ *
+ * Ahora cada socket se une a una "room" de Socket.IO según su entorno
+ * ('museo' o 'solar'), y cada evento se manda SOLO dentro de esa room con
+ * io.to(entorno)/socket.to(entorno). Además el estado (usuarios, profesor
+ * activo, turno de habla) está separado por entorno, así que un profesor en
+ * el museo no bloquea que haya otro profesor en el sistema solar, y un
+ * turno de habla activo en un entorno no afecta al otro.
+ * ─────────────────────────────────────────────────────────────────────────
  */
 
 const express = require('express');
@@ -30,12 +47,21 @@ const io     = new Server(server, {
 app.use(cors());
 app.use(express.static('public'));
 
-// ─── Estado global de la sala ─────────────────────────────────────────────────
-const sala = {
-  usuarios:    {},
-  profesorId:  null,
-  turnoActivo: null,
+// ─── Estado global, ahora separado por entorno ───────────────────────────────
+const ENTORNOS_VALIDOS = ['museo', 'solar'];
+
+function nuevaSala() {
+  return { usuarios: {}, profesorId: null, turnoActivo: null };
+}
+
+const salas = {
+  museo: nuevaSala(),
+  solar: nuevaSala()
 };
+
+function salaDe(entorno) {
+  return salas[entorno] || salas.museo;
+}
 
 let mensajesTotal  = 0;
 const inicioServer = Date.now();
@@ -45,16 +71,28 @@ io.on('connection', (socket) => {
 
   // 1 · Registro de usuario
   socket.on('registrar', ({ nombre, rol, avatar, entorno }) => {
+    // Validar/normalizar el entorno: si viene algo raro o vacío, museo por defecto.
+    entorno = ENTORNOS_VALIDOS.includes(entorno) ? entorno : 'museo';
+    const sala = salaDe(entorno);
+
     if (rol === 'profesor' && sala.profesorId) {
       rol = 'estudiante';
-      socket.emit('rol_cambiado', { rol, motivo: 'Ya existe un profesor activo' });
+      socket.emit('rol_cambiado', { rol, motivo: 'Ya existe un profesor activo en este entorno' });
     }
+
+    // Guardamos el entorno en el propio socket: los demás eventos (mover,
+    // mano, dar_turno, mic_estado, chat, disconnect...) no traen el entorno
+    // en su payload, así que lo necesitamos para saber a qué sala pertenece
+    // este socket sin tener que volver a preguntarlo.
+    socket.data.entorno = entorno;
+    socket.join(entorno);
+
     sala.usuarios[socket.id] = {
       id: socket.id,
       nombre: (nombre || 'Usuario').substring(0, 24),
       rol,
       avatar: avatar || null,
-      entorno: entorno || 'museo',
+      entorno,
       posicion: { x: 0, y: 0, z: 2 },
       rotacion: { x: 0, y: 0, z: 0 },
       manoLevantada: false,
@@ -66,28 +104,33 @@ io.on('connection', (socket) => {
     socket.emit('bienvenida', {
       tuId: socket.id,
       tuRol: rol,
-      usuarios: sala.usuarios,
+      usuarios: sala.usuarios,          // solo los usuarios de ESTE entorno
       profesorId: sala.profesorId,
       turnoActivo: sala.turnoActivo
     });
-    socket.broadcast.emit('usuario_entro', sala.usuarios[socket.id]);
+    // Avisar a los demás, pero SOLO a los que están en el mismo entorno.
+    socket.to(entorno).emit('usuario_entro', sala.usuarios[socket.id]);
     mensajesTotal++;
   });
 
   // 2 · Posición y rotación de cabeza (20 veces/segundo por cliente)
   socket.on('mover', ({ posicion, rotacion }) => {
+    const entorno = socket.data.entorno;
+    const sala = salaDe(entorno);
     if (!sala.usuarios[socket.id]) return;
     sala.usuarios[socket.id].posicion = posicion;
     sala.usuarios[socket.id].rotacion = rotacion;
-    socket.broadcast.emit('usuario_movio', { id: socket.id, posicion, rotacion });
+    socket.to(entorno).emit('usuario_movio', { id: socket.id, posicion, rotacion });
     mensajesTotal++;
   });
 
   // 3 · Mano levantada / bajada
   socket.on('mano', ({ levantada }) => {
+    const entorno = socket.data.entorno;
+    const sala = salaDe(entorno);
     if (!sala.usuarios[socket.id]) return;
     sala.usuarios[socket.id].manoLevantada = levantada;
-    io.emit('usuario_mano', {
+    io.to(entorno).emit('usuario_mano', {
       id: socket.id,
       nombre: sala.usuarios[socket.id].nombre,
       levantada
@@ -97,6 +140,8 @@ io.on('connection', (socket) => {
 
   // 4 · Profesor da / quita turno de habla
   socket.on('dar_turno', ({ idEstudiante }) => {
+    const entorno = socket.data.entorno;
+    const sala = salaDe(entorno);
     if (socket.id !== sala.profesorId) return;
     if (sala.turnoActivo && sala.usuarios[sala.turnoActivo]) {
       sala.usuarios[sala.turnoActivo].hablando = false;
@@ -107,20 +152,22 @@ io.on('connection', (socket) => {
       sala.usuarios[idEstudiante].hablando      = true;
       sala.usuarios[idEstudiante].manoLevantada = false;
       io.to(idEstudiante).emit('turno_recibido');
-      io.emit('turno_actualizado', {
+      io.to(entorno).emit('turno_actualizado', {
         id: idEstudiante,
         nombre: sala.usuarios[idEstudiante].nombre
       });
     } else {
-      io.emit('turno_actualizado', { id: null, nombre: null });
+      io.to(entorno).emit('turno_actualizado', { id: null, nombre: null });
     }
     mensajesTotal++;
   });
 
   // 5 · Chat de texto
   socket.on('chat', ({ texto }) => {
+    const entorno = socket.data.entorno;
+    const sala = salaDe(entorno);
     if (!sala.usuarios[socket.id] || !texto.trim()) return;
-    io.emit('chat_mensaje', {
+    io.to(entorno).emit('chat_mensaje', {
       id:     socket.id,
       nombre: sala.usuarios[socket.id].nombre,
       rol:    sala.usuarios[socket.id].rol,
@@ -130,8 +177,10 @@ io.on('connection', (socket) => {
     mensajesTotal++;
   });
 
-  // 6 · Estado micrófono (Sistema Solar)
+  // 6 · Estado micrófono (Sistema Solar y Museo)
   socket.on('mic_estado', ({ activo }) => {
+    const entorno = socket.data.entorno;
+    const sala = salaDe(entorno);
     if (!sala.usuarios[socket.id]) return;
     const u = sala.usuarios[socket.id];
     u.hablando = activo;
@@ -140,11 +189,16 @@ io.on('connection', (socket) => {
     // profesor (y así activar el foco de cámara en los estudiantes) — si no
     // viaja aquí, esa lógica del cliente nunca se activa por esta vía y queda
     // dependiendo solo del canal WebRTC (que no siempre conecta en celular).
-    socket.broadcast.emit('usuario_mic', { id: socket.id, activo, rol: u.rol, nombre: u.nombre });
+    socket.to(entorno).emit('usuario_mic', { id: socket.id, activo, rol: u.rol, nombre: u.nombre });
     mensajesTotal++;
   });
 
-  // 7 · WebRTC señalización (Sistema Solar — audio en tiempo real)
+  // 7 · WebRTC señalización (audio en tiempo real)
+  // Estos van dirigidos a un socket.id específico (io.to(to)), así que no
+  // hace falta filtrar por entorno: solo puede llegar al destinatario exacto,
+  // y ese destinatario ya está garantizado de estar en el mismo entorno
+  // porque los ids de "conectados" que maneja el cliente son solo los de su
+  // propia sala (gracias al fix de arriba en 'bienvenida'/'usuario_entro').
   socket.on('webrtc_offer',   ({ to, offer })     => io.to(to).emit('webrtc_offer',   { from: socket.id, offer }));
   socket.on('webrtc_answer',  ({ to, answer })    => io.to(to).emit('webrtc_answer',  { from: socket.id, answer }));
   socket.on('webrtc_ice',     ({ to, candidate }) => io.to(to).emit('webrtc_ice',     { from: socket.id, candidate }));
@@ -152,8 +206,11 @@ io.on('connection', (socket) => {
   // 8 · Ping para medir latencia (WP4)
   socket.on('ping_lat', (ts) => socket.emit('pong_lat', ts));
 
-  // 9 · Métricas del servidor (WP4)
+  // 9 · Métricas del servidor (WP4) — por entorno, para que cada módulo vea
+  // solo sus propios números de usuarios conectados.
   socket.on('pedir_metricas', () => {
+    const entorno = socket.data.entorno || 'museo';
+    const sala = salaDe(entorno);
     socket.emit('metricas', {
       usuariosConectados: Object.keys(sala.usuarios).length,
       mensajesTotal,
@@ -165,29 +222,40 @@ io.on('connection', (socket) => {
 
   // 10 · Desconexión
   socket.on('disconnect', () => {
+    const entorno = socket.data.entorno;
+    const sala = salaDe(entorno);
     if (!sala.usuarios[socket.id]) return;
     const u = sala.usuarios[socket.id];
     if (socket.id === sala.profesorId)  {
       sala.profesorId = null;
-      io.emit('profesor_salio');
+      io.to(entorno).emit('profesor_salio');
     }
     if (socket.id === sala.turnoActivo) {
       sala.turnoActivo = null;
-      io.emit('turno_actualizado', { id: null, nombre: null });
+      io.to(entorno).emit('turno_actualizado', { id: null, nombre: null });
     }
     delete sala.usuarios[socket.id];
-    io.emit('usuario_salio', { id: socket.id, nombre: u.nombre });
+    io.to(entorno).emit('usuario_salio', { id: socket.id, nombre: u.nombre });
   });
 });
 
 // ─── Endpoint de salud (para monitoreo y WP4) ────────────────────────────────
 app.get('/estado', (_req, res) => res.json({
   estado: 'activo',
-  usuarios: Object.keys(sala.usuarios).length,
-  profesor: sala.profesorId ? sala.usuarios[sala.profesorId]?.nombre : null,
-  turnoActivo: sala.turnoActivo,
   mensajesTotal,
-  uptime: Math.floor((Date.now() - inicioServer) / 1000) + 's'
+  uptime: Math.floor((Date.now() - inicioServer) / 1000) + 's',
+  entornos: {
+    museo: {
+      usuarios: Object.keys(salas.museo.usuarios).length,
+      profesor: salas.museo.profesorId ? salas.museo.usuarios[salas.museo.profesorId]?.nombre : null,
+      turnoActivo: salas.museo.turnoActivo
+    },
+    solar: {
+      usuarios: Object.keys(salas.solar.usuarios).length,
+      profesor: salas.solar.profesorId ? salas.solar.usuarios[salas.solar.profesorId]?.nombre : null,
+      turnoActivo: salas.solar.turnoActivo
+    }
+  }
 }));
 
 const PORT = process.env.PORT || 3000;
