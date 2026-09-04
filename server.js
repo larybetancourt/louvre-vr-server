@@ -7,22 +7,8 @@
  *   npm install
  *   node server.js
  *
- * EN GLITCH.COM:
- *   1. glitch.com → New Project → Hello Express
- *   2. Reemplazar server.js y package.json con estos archivos
- *   3. Glitch reinicia automáticamente
- *   4. Copiar la URL del proyecto (ej: https://mi-museo-louvre.glitch.me)
- *
  * ─────────────────────────────────────────────────────────────────────────
- * CAMBIO IMPORTANTE respecto a la versión anterior:
- * Antes, "sala" era un único objeto global compartido por TODOS los
- * conectados, sin importar si estaban en el museo o en el sistema solar.
- * Por eso alguien que entraba al museo también "aparecía" en el sistema
- * solar (y viceversa): los eventos (usuario_entro, mover, mano, dar_turno,
- * mic_estado, chat...) se mandaban a TODO el servidor con io.emit() /
- * socket.broadcast.emit(), sin filtrar por entorno.
- *
- * Ahora cada socket se une a una "room" de Socket.IO según su entorno
+ * Cada socket se une a una "room" de Socket.IO según su entorno
  * ('museo' o 'solar'), y cada evento se manda SOLO dentro de esa room con
  * io.to(entorno)/socket.to(entorno). Además el estado (usuarios, profesor
  * activo, turno de habla) está separado por entorno, así que un profesor en
@@ -66,12 +52,54 @@ function salaDe(entorno) {
 let mensajesTotal  = 0;
 const inicioServer = Date.now();
 
+// ─── Medición de recursos del proceso (WP5) ──────────────────────────────────
+// El panel de Render no expone CPU ni memoria en el plan gratuito, pero Node
+// sí puede medirse a sí mismo. El muestreo se hace en un intervalo fijo y no
+// dentro de los manejadores de petición, para que /estado y pedir_metricas
+// lean el mismo valor sin reiniciar la ventana de medición el uno al otro.
+//
+// Límites asignados por el plan gratuito de Render, usados para expresar el
+// consumo como porcentaje de lo realmente disponible:
+const LIMITE_CPU_NUCLEOS = 0.15;
+const LIMITE_MEMORIA_MB  = 512;
+
+let cpuPorcentajeNucleo = 0;
+let _cpuPrevio    = process.cpuUsage();
+let _tiempoPrevio = Date.now();
+
+setInterval(() => {
+  const ahora = process.cpuUsage();
+  const t     = Date.now();
+  // process.cpuUsage() devuelve microsegundos de CPU consumidos.
+  const usados  = (ahora.user - _cpuPrevio.user) + (ahora.system - _cpuPrevio.system);
+  const ventana = (t - _tiempoPrevio) * 1000;
+  cpuPorcentajeNucleo = ventana > 0 ? +(100 * usados / ventana).toFixed(2) : 0;
+  _cpuPrevio    = ahora;
+  _tiempoPrevio = t;
+}, 1000);
+
+function recursos() {
+  const m = process.memoryUsage();
+  const rssMB = +(m.rss / 1048576).toFixed(1);
+  return {
+    // Porcentaje de un núcleo completo:
+    cpuPorcentajeNucleo,
+    // Porcentaje sobre los 0.15 núcleos asignados. Este es el que indica
+    // saturación real: 100 significa que el proceso agotó su cuota.
+    cpuPorcentajeLimite: +(100 * cpuPorcentajeNucleo / (LIMITE_CPU_NUCLEOS * 100)).toFixed(1),
+    rssMB,
+    memoriaPorcentajeLimite: +(100 * rssMB / LIMITE_MEMORIA_MB).toFixed(1),
+    heapUsadoMB:  +(m.heapUsed  / 1048576).toFixed(1),
+    heapTotalMB:  +(m.heapTotal / 1048576).toFixed(1),
+    limites: { cpuNucleos: LIMITE_CPU_NUCLEOS, memoriaMB: LIMITE_MEMORIA_MB }
+  };
+}
+
 // ─── Eventos de conexión ──────────────────────────────────────────────────────
 io.on('connection', (socket) => {
 
   // 1 · Registro de usuario
   socket.on('registrar', ({ nombre, rol, avatar, entorno }) => {
-    // Validar/normalizar el entorno: si viene algo raro o vacío, museo por defecto.
     entorno = ENTORNOS_VALIDOS.includes(entorno) ? entorno : 'museo';
     const sala = salaDe(entorno);
 
@@ -80,10 +108,6 @@ io.on('connection', (socket) => {
       socket.emit('rol_cambiado', { rol, motivo: 'Ya existe un profesor activo en este entorno' });
     }
 
-    // Guardamos el entorno en el propio socket: los demás eventos (mover,
-    // mano, dar_turno, mic_estado, chat, disconnect...) no traen el entorno
-    // en su payload, así que lo necesitamos para saber a qué sala pertenece
-    // este socket sin tener que volver a preguntarlo.
     socket.data.entorno = entorno;
     socket.join(entorno);
 
@@ -104,16 +128,15 @@ io.on('connection', (socket) => {
     socket.emit('bienvenida', {
       tuId: socket.id,
       tuRol: rol,
-      usuarios: sala.usuarios,          // solo los usuarios de ESTE entorno
+      usuarios: sala.usuarios,
       profesorId: sala.profesorId,
       turnoActivo: sala.turnoActivo
     });
-    // Avisar a los demás, pero SOLO a los que están en el mismo entorno.
     socket.to(entorno).emit('usuario_entro', sala.usuarios[socket.id]);
     mensajesTotal++;
   });
 
-  // 2 · Posición y rotación de cabeza (20 veces/segundo por cliente)
+  // 2 · Posición y rotación de cabeza (hasta 20 veces/segundo por cliente)
   socket.on('mover', ({ posicion, rotacion }) => {
     const entorno = socket.data.entorno;
     const sala = salaDe(entorno);
@@ -184,30 +207,19 @@ io.on('connection', (socket) => {
     if (!sala.usuarios[socket.id]) return;
     const u = sala.usuarios[socket.id];
     u.hablando = activo;
-    // IMPORTANTE: mandamos rol y nombre siempre, no solo id/activo.
-    // El cliente necesita "rol" para saber si quien prendió el mic es el
-    // profesor (y así activar el foco de cámara en los estudiantes) — si no
-    // viaja aquí, esa lógica del cliente nunca se activa por esta vía y queda
-    // dependiendo solo del canal WebRTC (que no siempre conecta en celular).
     socket.to(entorno).emit('usuario_mic', { id: socket.id, activo, rol: u.rol, nombre: u.nombre });
     mensajesTotal++;
   });
 
   // 7 · WebRTC señalización (audio en tiempo real)
-  // Estos van dirigidos a un socket.id específico (io.to(to)), así que no
-  // hace falta filtrar por entorno: solo puede llegar al destinatario exacto,
-  // y ese destinatario ya está garantizado de estar en el mismo entorno
-  // porque los ids de "conectados" que maneja el cliente son solo los de su
-  // propia sala (gracias al fix de arriba en 'bienvenida'/'usuario_entro').
   socket.on('webrtc_offer',   ({ to, offer })     => io.to(to).emit('webrtc_offer',   { from: socket.id, offer }));
   socket.on('webrtc_answer',  ({ to, answer })    => io.to(to).emit('webrtc_answer',  { from: socket.id, answer }));
   socket.on('webrtc_ice',     ({ to, candidate }) => io.to(to).emit('webrtc_ice',     { from: socket.id, candidate }));
 
-  // 8 · Ping para medir latencia (WP4)
+  // 8 · Ping para medir latencia (WP5)
   socket.on('ping_lat', (ts) => socket.emit('pong_lat', ts));
 
-  // 9 · Métricas del servidor (WP4) — por entorno, para que cada módulo vea
-  // solo sus propios números de usuarios conectados.
+  // 9 · Métricas del servidor (WP5) — por entorno, más recursos del proceso.
   socket.on('pedir_metricas', () => {
     const entorno = socket.data.entorno || 'museo';
     const sala = salaDe(entorno);
@@ -216,7 +228,8 @@ io.on('connection', (socket) => {
       mensajesTotal,
       uptimeSegundos: Math.floor((Date.now() - inicioServer) / 1000),
       profesorPresente: !!sala.profesorId,
-      turnoActivo: sala.turnoActivo
+      turnoActivo: sala.turnoActivo,
+      recursos: recursos()
     });
   });
 
@@ -239,11 +252,12 @@ io.on('connection', (socket) => {
   });
 });
 
-// ─── Endpoint de salud (para monitoreo y WP4) ────────────────────────────────
+// ─── Endpoint de salud (para monitoreo y WP5) ────────────────────────────────
 app.get('/estado', (_req, res) => res.json({
   estado: 'activo',
   mensajesTotal,
   uptime: Math.floor((Date.now() - inicioServer) / 1000) + 's',
+  recursos: recursos(),
   entornos: {
     museo: {
       usuarios: Object.keys(salas.museo.usuarios).length,
